@@ -8,7 +8,7 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
-import PyPDF2
+import pypdf
 from PIL import Image
 import pytesseract
 
@@ -132,7 +132,7 @@ class DocumentProcessor:
         try:
             # Try text extraction first
             pdf_file = io.BytesIO(file_bytes)
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            pdf_reader = pypdf.PdfReader(pdf_file)
             doc.total_pages = len(pdf_reader.pages)
 
             pages_with_text = 0

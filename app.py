@@ -11,10 +11,14 @@ Date: September 2026
 
 import streamlit as st
 import pandas as pd
+import hashlib
 from components.file_uploader import file_uploader_section, get_upload_summary
 from components.disclaimer import show_disclaimer, show_footer_disclaimer
 from processors.document_processor import process_uploaded_documents, ProcessingStatus
 from processors.medication_extractor import extract_medications_from_processed_documents, ExtractionStatus
+from processors.normalization_storage import normalize_and_store
+from processors.reconciliation_engine import reconcile
+from processors.evidence_rag import build_evidence_cards
 
 
 # Page configuration
@@ -125,9 +129,27 @@ def main():
         st.session_state.processed_documents = None
     if 'extracted_medications' not in st.session_state:
         st.session_state.extracted_medications = None
+    if 'reconciliation_result' not in st.session_state:
+        st.session_state.reconciliation_result = None
+    if 'evidence_cards' not in st.session_state:
+        st.session_state.evidence_cards = None
+    if 'normalized_records' not in st.session_state:
+        st.session_state.normalized_records = None
+    signature = tuple((kind, item.name, hashlib.sha256(item.getvalue()).hexdigest())
+                      for kind, item in sorted(uploaded_files.items()) if item is not None)
+    if st.session_state.get('upload_signature') != signature:
+        st.session_state.upload_signature = signature
+        st.session_state.processed_documents = None
+        st.session_state.extracted_medications = None
+        st.session_state.reconciliation_result = None
+        st.session_state.evidence_cards = None
+        st.session_state.normalized_records = None
 
     if summary['uploaded'] > 0:
-        if st.button("🚀 Process Documents & Extract Medications", type="primary", use_container_width=True):
+        if st.button("🚀 Process Documents & Extract Medications", type="primary", width="stretch"):
+            st.session_state.reconciliation_result = None
+            st.session_state.evidence_cards = None
+            st.session_state.normalized_records = None
             with st.spinner("Processing documents... This may take a moment."):
                 # Step 1: Process all uploaded documents
                 st.session_state.processed_documents = process_uploaded_documents(uploaded_files)
@@ -142,15 +164,24 @@ def main():
                         )
                         total_meds = sum(doc.get_medication_count() for doc in st.session_state.extracted_medications)
                         st.success(f"✅ Medication extraction complete! {total_meds} medication(s) extracted from {len(st.session_state.extracted_medications)} document(s).")
+                        run_data = normalize_and_store(
+                            st.session_state.processed_documents,
+                            st.session_state.extracted_medications
+                        )
+                        comparison = reconcile(run_data)
+                        st.session_state.normalized_records = run_data.records
+                        st.session_state.reconciliation_result = comparison
+                        st.session_state.evidence_cards = build_evidence_cards(run_data, comparison.findings)
+                        st.success(f"Comparison complete: {len(comparison.findings)} possible finding(s) for review.")
                     except Exception as e:
                         st.error(f"❌ Medication extraction failed: {str(e)}")
-                        st.info("💡 Please ensure your .env file is configured with LLM_PROVIDER and API keys.")
+                        st.info("Check extraction configuration and the local SQLite database path.")
                         st.session_state.extracted_medications = None
     else:
         st.button(
             "🚀 Process Documents & Extract Medications",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=True
         )
         st.info("📄 Upload at least one document to begin processing.")
@@ -222,15 +253,9 @@ def main():
                                 st.markdown(f"### Page {page.page_number}")
                                 st.caption(f"Extraction method: {page.extraction_method}")
 
-                                # Display extracted text in a scrollable text area
+                                # Wrap every line and show the entire page without a fixed-height input box.
                                 if page.text:
-                                    st.text_area(
-                                        f"Page {page.page_number} Content",
-                                        value=page.text,
-                                        height=300,
-                                        key=f"text_{idx}_page_{page.page_number}",
-                                        disabled=True
-                                    )
+                                    st.code(page.text, language=None, wrap_lines=True)
                                 else:
                                     st.info("No text extracted from this page.")
                         else:
@@ -297,7 +322,7 @@ def main():
                             })
 
                         df = pd.DataFrame(med_data)
-                        st.dataframe(df, use_container_width=True, hide_index=True)
+                        st.dataframe(df, width="stretch", hide_index=True)
 
                         # Detailed view for each medication
                         st.markdown("#### Detailed Medication Information")
@@ -330,38 +355,57 @@ def main():
                                 st.markdown(f"- **Page:** {med.source_page or 'Unknown'}")
 
                                 st.markdown("**Evidence Text:**")
-                                st.text_area(
-                                    "Original text from document",
-                                    value=med.evidence_text,
-                                    height=100,
-                                    key=f"evidence_{doc_meds.filename}_{idx}",
-                                    disabled=True
-                                )
+                                st.code(med.evidence_text or "No evidence text extracted.",
+                                        language=None, wrap_lines=True)
 
                     st.markdown("---")
 
         else:
             st.info("🚧 Process documents to extract medication information.")
 
-    # Medication Comparison (placeholder)
-    with st.expander("🔄 Medication Comparison", expanded=False):
-        st.info("🚧 This section will show side-by-side medication comparisons in future versions.")
+    comparison = st.session_state.reconciliation_result
+    cards = st.session_state.evidence_cards
+    with st.expander("🔄 Medication Comparison", expanded=bool(comparison)):
+        if comparison:
+            st.caption("Name matching uses explicit extracted generic names or exact names. Missing fields are not treated as differences.")
+            st.metric("Possible findings", len(comparison.findings))
+            records = st.session_state.normalized_records or []
+            if records:
+                st.dataframe(pd.DataFrame([{
+                    "Medication": r.name, "Document": r.document_type.replace('_', ' ').title(),
+                    "Strength": r.strength or "—", "Dose": r.dose or "—",
+                    "Route": r.route or "—", "Frequency": r.frequency or "—",
+                    "Status": r.status or "Unknown", "Page": r.page or "—"
+                } for r in records]), width="stretch", hide_index=True)
+            for warning in comparison.warnings:
+                st.warning(warning)
+        else:
+            st.info("Process documents to compare extracted medication entries.")
 
-    # Possible Discrepancies (placeholder)
-    with st.expander("⚠️ Possible Discrepancies", expanded=False):
-        st.info("🚧 This section will list identified discrepancies with severity levels in future versions.")
-        st.markdown("""
-        **Future discrepancy categories will include:**
-        - New medication added
-        - Possible removed/stopped medication
-        - Dose change detected
-        - Frequency change detected
-        - Duplicate medication identified
-        """)
+    with st.expander("⚠️ Possible Discrepancies", expanded=bool(comparison)):
+        if comparison:
+            if not comparison.findings:
+                st.info("No rule-based differences detected in the extracted entries. This is not a clinical clearance.")
+            for index, finding in enumerate(comparison.findings, 1):
+                st.markdown(f"**{index}. {finding.medication}: {finding.summary}**")
+                st.write(finding.detail)
+                st.caption(finding.review_status)
+        else:
+            st.info("Process documents to see possible differences.")
 
-    # Source Evidence (placeholder)
     with st.expander("📋 Source Evidence", expanded=False):
-        st.info("🚧 This section will show relevant excerpts from source documents supporting each finding.")
+        if cards is None:
+            st.info("Process documents to retrieve cited excerpts.")
+        elif not cards:
+            st.info("No findings requiring source excerpts.")
+        else:
+            for index, card in enumerate(cards, 1):
+                st.markdown(f"**{index}. {card.finding.medication}: {card.finding.summary}**")
+                for citation in card.citations:
+                    label = "Extracted excerpt found on page" if citation.verified else "Name mention only"
+                    st.caption(f"{citation.document_type} · {citation.filename} · page {citation.page} · {label}")
+                    st.code(citation.quote, language=None, wrap_lines=True)
+                st.caption(card.note)
 
     # Footer disclaimer
     show_footer_disclaimer()
@@ -370,7 +414,7 @@ def main():
     with st.sidebar:
         st.header("ℹ️ About")
         st.markdown("""
-        **Version:** Level 3 Prototype
+        **Version:** Level 6 Prototype
 
         **Current Features:**
         - Document upload interface
@@ -383,11 +427,12 @@ def main():
         - **Structured medication data**
         - **Source tracking**
 
-        **Coming Soon:**
-        - Medication comparison logic
-        - Discrepancy identification
-        - Evidence linking
-        - Medication normalization
+        - Medication normalization and local SQLite storage
+        - Rule-based comparison and discrepancy flags
+        - Page-level source evidence retrieval
+
+        **Limitations:** Exact name matching can miss brand/generic equivalents;
+        all discrepancies and citations require human review.
         """)
 
         st.markdown("---")

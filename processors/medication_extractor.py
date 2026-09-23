@@ -5,6 +5,9 @@ Uses LLM to extract structured medication information from document text.
 
 import os
 import json
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -12,7 +15,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 # Load environment variables
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
 
 class ExtractionStatus(Enum):
@@ -88,15 +91,35 @@ class MedicationExtractor:
 
     def __init__(self):
         """Initialize medication extractor with LLM client."""
-        self.provider = os.getenv("LLM_PROVIDER", "openai").lower()
-        self.model = os.getenv("LLM_MODEL", "gpt-4o")
+        self.provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+        if not self.provider:
+            configured = [provider for provider, env_name in (
+                ("cohere", "COHERE_API_KEY"),
+                ("openai", "OPENAI_API_KEY"),
+                ("anthropic", "ANTHROPIC_API_KEY"),
+            ) if os.getenv(env_name, "").strip()]
+            if len(configured) != 1:
+                raise ValueError(
+                    "Set LLM_PROVIDER=cohere and COHERE_API_KEY in the project-root .env file "
+                    "(or choose one configured provider)."
+                )
+            self.provider = configured[0]
+        default_models = {
+            "cohere": "command-a-03-2025",
+            "openai": "gpt-4o",
+            "anthropic": "claude-3-5-sonnet-20241022",
+        }
+        self.model = os.getenv("LLM_MODEL", "").strip() or default_models.get(self.provider, "")
         self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.0"))
 
         # Initialize LLM client based on provider
         if self.provider == "openai":
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
-                raise ValueError("OPENAI_API_KEY not found in environment. Please configure .env file.")
+                raise ValueError(
+                    "LLM_PROVIDER is set to openai but OPENAI_API_KEY is missing. "
+                    "If you use Cohere, set LLM_PROVIDER=cohere and COHERE_API_KEY in the project-root .env file."
+                )
             import openai
             self.client = openai.OpenAI(api_key=api_key)
         elif self.provider == "anthropic":
@@ -107,10 +130,11 @@ class MedicationExtractor:
             self.client = anthropic.Anthropic(api_key=api_key)
         elif self.provider == "cohere":
             api_key = os.getenv("COHERE_API_KEY")
-            if not api_key:
-                raise ValueError("COHERE_API_KEY not found in environment. Please configure .env file.")
-            import cohere
-            self.client = cohere.ClientV2(api_key=api_key)
+            if not api_key or api_key.strip() in {"<api key>", "your-api-key", "your_cohere_api_key"}:
+                raise ValueError("COHERE_API_KEY is missing or still a placeholder. Set it in the project-root .env file.")
+            # Use the documented V2 HTTPS endpoint directly. A broken Cohere SDK
+            # installation should not prevent extraction from starting.
+            self.cohere_api_key = api_key.strip()
         else:
             raise ValueError(f"Unsupported LLM provider: {self.provider}. Supported providers: openai, anthropic, cohere")
 
@@ -311,37 +335,49 @@ Extract medications now:"""
             raise Exception(f"Anthropic extraction failed: {str(e)}")
 
     def _extract_with_cohere(self, prompt: str) -> Dict[str, Any]:
-        """Extract medications using Cohere API."""
+        """Extract JSON with Cohere V2 Chat using Python's standard library."""
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "response_format": {"type": "json_object"},
+        }
+        request = Request(
+            "https://api.cohere.com/v2/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": "Bearer {}".format(self.cohere_api_key),
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
         try:
-            response = self.client.chat(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=self.temperature
-            )
+            with urlopen(request, timeout=90) as response:
+                body = json.load(response)
+        except HTTPError as error:
+            if error.code in (401, 403):
+                reason = "Check the Cohere API key and account permissions."
+            elif error.code == 429:
+                reason = "Rate limit reached; try again later."
+            elif error.code == 400:
+                reason = "Check LLM_MODEL and the request configuration."
+            else:
+                reason = "Check the Cohere service status and retry."
+            raise RuntimeError("Cohere API returned HTTP {}. {}".format(error.code, reason)) from error
+        except URLError as error:
+            raise RuntimeError("Could not reach Cohere's API. Check network access and retry.") from error
 
-            # Extract text content from Cohere response
-            content = response.message.content[0].text
-
-            # Parse JSON from response
-            # Cohere may include markdown code blocks, so extract JSON
-            if "```json" in content:
-                json_start = content.find("```json") + 7
-                json_end = content.find("```", json_start)
-                content = content[json_start:json_end].strip()
-            elif "```" in content:
-                json_start = content.find("```") + 3
-                json_end = content.find("```", json_start)
-                content = content[json_start:json_end].strip()
-
-            return json.loads(content)
-
-        except Exception as e:
-            raise Exception(f"Cohere extraction failed: {str(e)}")
+        try:
+            if body.get("finish_reason") not in (None, "COMPLETE"):
+                raise ValueError("Cohere response was incomplete")
+            content = "".join(part["text"] for part in body["message"]["content"] if part.get("type") == "text")
+            medications_data = json.loads(content)
+            if not isinstance(medications_data, dict) or not isinstance(medications_data.get("medications"), list):
+                raise ValueError("Response is missing a medications list")
+            return medications_data
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("Cohere returned an invalid medication JSON response.") from error
 
     def _find_source_page(self, evidence_text: str, page_info: List[tuple]) -> Optional[int]:
         """
